@@ -1,6 +1,6 @@
 // Guarda o app no aparelho para abrir sem internet.
 // Ao publicar uma nova versão, aumente o número abaixo.
-const CACHE = 'meus-gastos-v1';
+const CACHE = 'meus-gastos-v2';
 const FILES = ['./', 'index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', e => {
@@ -13,7 +13,8 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
   e.respondWith(
-    fetch(e.request).then(r => {
+    // 'no-cache' = sempre confere no GitHub se há versão nova (quando há internet)
+    fetch(e.request, {cache: 'no-cache'}).then(r => {
       const copy = r.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); return r;
     }).catch(() => caches.match(e.request, {ignoreSearch: true}).then(r => r || caches.match('index.html')))
   );

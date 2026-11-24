@@ -232,18 +232,30 @@ function parseDate(raw){
   }
   return null;
 }
+const isOFX = text => /<\s*(OFX|STMTTRN|BANKTRANLIST)\b/i.test(text) || /^\s*OFXHEADER/i.test(text);
+function decodeEntities(s){ return s.replace(/&amp;/gi,'&').replace(/&lt;/gi,'<').replace(/&gt;/gi,'>').replace(/&quot;/gi,'"').replace(/&apos;|&#39;/gi,"'"); }
 function parseOFX(text){
   const out = [];
-  const blocks = text.split(/<STMTTRN>/i).slice(1);
-  const tag = (b,t) => { const r = b.match(new RegExp('<'+t+'>([^<\\r\\n]*)','i')); return r ? r[1].trim() : ''; };
+  const blocks = text.split(/<\s*STMTTRN\b[^>]*>/i).slice(1);
+  const tag = (b,t) => { const r = b.match(new RegExp('<\\s*'+t+'\\b[^>]*>\\s*([^<\\r\\n]*)','i')); return r ? decodeEntities(r[1].trim()) : ''; };
   for(const b of blocks){
-    const date = parseDate(tag(b,'DTPOSTED'));
-    const amount = parseFloat(tag(b,'TRNAMT').replace(',','.'));
-    const desc = tag(b,'MEMO') || tag(b,'NAME') || tag(b,'TRNTYPE');
+    const date = parseDate(tag(b,'DTPOSTED') || tag(b,'DTUSER') || tag(b,'DTAVAIL'));
+    const amount = parseAmount(tag(b,'TRNAMT'));
+    const desc = [tag(b,'NAME'), tag(b,'MEMO')].filter(Boolean).filter((x,i,a)=>a.indexOf(x)===i).join(' - ') || tag(b,'PAYEE') || tag(b,'TRNTYPE');
     const fitid = tag(b,'FITID');
     if(date && !isNaN(amount)) out.push({date, amount, desc, fitid});
   }
   return out;
+}
+// explica por que um arquivo não foi lido (sem mostrar os dados dele)
+function diagnose(name, text){
+  const t = text.trimStart().slice(0,400).toLowerCase();
+  if(!text.trim()) return `${name}: o arquivo está vazio. Tente baixar de novo.`;
+  if(t.startsWith('%pdf')) return `${name}: é um PDF, não um OFX/CSV. No banco, escolha o formato OFX ou CSV.`;
+  if(t.startsWith('pk')) return `${name}: parece ser uma planilha Excel. Abra e salve como CSV.`;
+  if(/<!doctype html|<html/.test(t)) return `${name}: o arquivo é uma página da web, não o extrato. Provavelmente o download falhou — tente baixar de novo (de preferência pelo site do banco no computador).`;
+  if(isOFX(text)) return `${name}: é um OFX, mas não tem nenhum lançamento dentro. Confira se o período escolhido no banco tem movimentações.`;
+  return `${name}: não encontrei colunas de data e valor.`;
 }
 function splitCSVLine(line, d){
   const res=[]; let cur='', q=false;
@@ -290,16 +302,17 @@ function parseCSV(text){
   }
   return out;
 }
-function readFile(file){
-  return new Promise(res=>{
-    const r = new FileReader();
-    r.onload = () => {
-      if(r.result.includes('�')){
-        const r2 = new FileReader(); r2.onload=()=>res(r2.result); r2.readAsText(file,'ISO-8859-1');
-      } else res(r.result);
-    };
-    r.readAsText(file,'UTF-8');
-  });
+async function readFile(file){
+  const buf = new Uint8Array(await file.arrayBuffer());
+  // UTF-16 (alguns bancos exportam assim)
+  if(buf[0]===0xFF && buf[1]===0xFE) return new TextDecoder('utf-16le').decode(buf.subarray(2));
+  if(buf[0]===0xFE && buf[1]===0xFF) return new TextDecoder('utf-16be').decode(buf.subarray(2));
+  const sample = buf.subarray(0, 200); let zeros = 0; sample.forEach(b=>{ if(b===0) zeros++; });
+  if(zeros > sample.length/4) return new TextDecoder(sample[0]===0 ? 'utf-16be' : 'utf-16le').decode(buf);
+  let text;
+  try{ text = new TextDecoder('utf-8', {fatal:true}).decode(buf); }
+  catch(e){ text = new TextDecoder('windows-1252').decode(buf); }
+  return text.replace(/^﻿/, '').replace(/\0/g, '');
 }
 
 /* ---------- import ---------- */
@@ -321,13 +334,14 @@ $('impOk').onclick = async () => {
   if(!bank){ $('impBank').focus(); return; }
   const isCard = $('impCard').checked;
   const existing = new Set(state.tx.map(t=>t.id));
-  let added=0, dup=0, bad=0;
+  let added=0, dup=0; const problems=[];
   for(const f of pendingFiles){
     const text = await readFile(f);
-    const rows = /<OFX>|<STMTTRN>/i.test(text) ? parseOFX(text) : parseCSV(text);
-    if(!rows.length){ bad++; continue; }
+    const ofx = isOFX(text);
+    const rows = ofx ? parseOFX(text) : parseCSV(text);
+    if(!rows.length){ problems.push(diagnose(f.name, text)); continue; }
     for(const r of rows){
-      const amount = isCard && !/<OFX>|<STMTTRN>/i.test(text) ? -r.amount : r.amount;
+      const amount = isCard && !ofx ? -r.amount : r.amount;
       const id = bank+'|'+(r.fitid ? 'f'+r.fitid : hash(r.date+'|'+amount.toFixed(2)+'|'+norm(r.desc)));
       if(existing.has(id)){ dup++; continue; }
       existing.add(id);
@@ -338,7 +352,8 @@ $('impOk').onclick = async () => {
   save(); $('dlgImport').close();
   if(added){ const last = state.tx.reduce((a,t)=>t.date>a?t.date:a,''); $('fMonth').dataset.want = last.slice(0,7); }
   render();
-  toast(`${added} lançamento(s) importado(s)` + (dup?` · ${dup} repetido(s) ignorado(s)`:'') + (bad?` · ${bad} arquivo(s) não reconhecido(s)`:''));
+  toast(`${added} lançamento(s) importado(s)` + (dup?` · ${dup} repetido(s) ignorado(s)`:''));
+  if(problems.length) alert('Não consegui ler:\n\n' + problems.join('\n\n'));
 };
 
 /* ---------- manual add ---------- */
